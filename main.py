@@ -10,14 +10,9 @@ from oauth2client.service_account import ServiceAccountCredentials
 from linebot import LineBotApi
 from linebot.models import FlexSendMessage
 from linebot.exceptions import LineBotApiError
-from dotenv import load_dotenv
-
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-# Load environment variables
-load_dotenv()
 
 def get_google_creds():
     """
@@ -106,8 +101,10 @@ def create_flex_message(ticker, signal, price, k, d, time_str):
     color = "#E03E3E" if signal == 'BUY' else "#2DB84D"
     signal_text = "強勢買進 🚀" if signal == 'BUY' else "高檔賣出 📉"
     
+    # ... (Bubble definition) ...
     bubble = {
       "type": "bubble",
+      # ... (Header as before) ...
       "size": "mega",
       "header": {
         "type": "box",
@@ -184,6 +181,7 @@ def create_flex_message(ticker, signal, price, k, d, time_str):
                   }
                 ]
               },
+              # ... (D Value and Time) ...
               {
                 "type": "box",
                 "layout": "baseline",
@@ -268,8 +266,55 @@ def push_flex_notification(user_id, flex_message):
     except LineBotApiError as e:
         logger.error(f"LINE API Error: {e}")
 
+def check_market_trend():
+    """
+    Check Taiwan Weighted Index (^TWII) trend against 20MA (Month Line).
+    Returns: 'UP' (Bullish) or 'DOWN' (Bearish), and a string message.
+    """
+    try:
+        ticker = "^TWII"
+        # Download roughly 2 months to get a valid 20MA
+        df = yf.download(ticker, period="2mo", interval="1d", progress=False)
+        
+        if df.empty or len(df) < 20:
+             logger.warning("Insufficient data for Market Trend.")
+             return 'UP', "無法判定 (資料不足)" # Fail open (allow buys) or closed? Let's fail open but log.
+             
+        # Flatten columns if MultiIndex
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        # Calculate SMA 20
+        # pandas-ta usually adds a column like 'SMA_20'
+        df.ta.sma(length=20, append=True)
+        
+        col_name = 'SMA_20'
+        if col_name not in df.columns:
+             # Fallback
+             return 'UP', "無法判定 (MA計算失敗)"
+
+        latest = df.iloc[-1]
+        price = latest['Close']
+        ma20 = latest[col_name]
+        
+        if pd.isna(ma20):
+             return 'UP', "無法判定 (MA為空)"
+
+        if price > ma20:
+            return 'UP', f"大盤強勢 (指數 {price:.0f} > 月線 {ma20:.0f})"
+        else:
+            return 'DOWN', f"大盤弱勢 (指數 {price:.0f} < 月線 {ma20:.0f})"
+
+    except Exception as e:
+        logger.error(f"Error checking market trend: {e}")
+        return 'UP', "無法判定 (發生錯誤)"
+
 def main():
     logger.info("Starting Stock KD Bot (v2.0 Refined)...")
+    
+    # 0. Check Market Trend
+    trend, trend_msg = check_market_trend()
+    logger.info(f"Market Trend: {trend} - {trend_msg}")
     
     # 1. Connect to Google Sheets
     creds = get_google_creds()
@@ -304,6 +349,11 @@ def main():
         for ticker in tickers:
             signal, k, d, price = check_kd_signal(ticker)
             if signal:
+                # MARKET FILTER LOGIC
+                if signal == 'BUY' and trend == 'DOWN':
+                    logger.info(f"Signal detected for {ticker}: {signal}, but BLOCKED by Market Filter ({trend_msg})")
+                    continue
+
                 logger.info(f"Signal detected for {ticker}: {signal}")
                 ticker_signals[ticker] = {
                     'type': signal,
@@ -329,7 +379,7 @@ def main():
             
             if t in ticker_signals and uid:
                 sig_data = ticker_signals[t]
-                
+
                 # Create Flex Message
                 msg = create_flex_message(
                     ticker=t,
