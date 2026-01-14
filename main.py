@@ -10,6 +10,11 @@ from oauth2client.service_account import ServiceAccountCredentials
 from linebot import LineBotApi
 from linebot.models import FlexSendMessage
 from linebot.exceptions import LineBotApiError
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -41,6 +46,25 @@ def get_google_creds():
     logger.error("No credentials found.")
     return None
 
+def get_stock_fundamentals(ticker):
+    """
+    Get fundamental data: PE, EPS, Dividend Yield.
+    Returns dict or None.
+    """
+    try:
+        t_str = str(ticker).strip()
+        stock_ticker = f"{t_str}.TW" if "." not in t_str else t_str
+        info = yf.Ticker(stock_ticker).info
+        
+        return {
+            'pe': info.get('trailingPE'),
+            'eps': info.get('trailingEps'),
+            'yield': info.get('dividendYield') # usually float 0.012 for 1.2%
+        }
+    except Exception as e:
+        logger.error(f"Error fetching fundamentals for {ticker}: {e}")
+        return None
+
 def check_kd_signal(ticker):
     """
     Check KD signal for a given ticker with robust MultiIndex handling.
@@ -50,22 +74,36 @@ def check_kd_signal(ticker):
         t_str = str(ticker).strip()
         stock_ticker = f"{t_str}.TW" if "." not in t_str else t_str
         
-        # Download data (1mo is sufficient for recent KD)
-        df = yf.download(stock_ticker, period="1mo", interval="1d", progress=False)
+        # Download data (Need 6mo for MA60)
+        df = yf.download(stock_ticker, period="6mo", interval="1d", progress=False)
         
-        if df.empty or len(df) < 14:
+        if df.empty or len(df) < 60:
             logger.warning(f"Insufficient data for {stock_ticker}")
-            return None, 0, 0, 0
+            return None, 0, 0, 0, 0.0
 
         # Flatten columns if MultiIndex (fix for recent yfinance)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
-        # Calculate KD (14, 3, 3)
+        # Calculate Indicators
         stoch = df.ta.stoch(k=14, d=3, smooth_k=3)
+        sma60 = df.ta.sma(length=60)
+        rsi = df.ta.rsi(length=14)
+
+        # Calculate Volume SMA (5 days)
+        if 'Volume' in df.columns:
+            vol_sma = df.ta.sma(length=5, close='Volume')
+            if not df['Volume'].empty and vol_sma is not None and not vol_sma.empty:
+                vol_today = df['Volume'].iloc[-1]
+                vol_avg = vol_sma.iloc[-1]
+                vol_ratio = vol_today / vol_avg if vol_avg > 0 else 1.0
+            else:
+                vol_ratio = 1.0
+        else:
+            vol_ratio = 1.0
         
         if stoch is None or stoch.empty:
-             return None, 0, 0, 0
+             return None, 0, 0, 0, 0.0
         
         # Get latest values
         # pandas-ta columns: STOCHk_14_3_3, STOCHd_14_3_3
@@ -74,37 +112,122 @@ def check_kd_signal(ticker):
         k_prev = stoch['STOCHk_14_3_3'].iloc[-2]
         d_prev = stoch['STOCHd_14_3_3'].iloc[-2]
         
+        # New Indicators (Trend & Momentum)
+        ma60_val = sma60.iloc[-1] if sma60 is not None else 0
+        rsi_val = rsi.iloc[-1] if rsi is not None else 50
+        
         # Get Price
         current_price = df['Close'].iloc[-1]
         
         signal = None
         
-        # BUY Signal: K < 20 and K crosses above D
+        # BUY Signal: K < 20 and Gold Cross AND Trend > 60MA
         if k_today < 20 and k_prev < d_prev and k_today > d_today:
-            signal = 'BUY'
+            if current_price > ma60_val:
+                signal = 'BUY'
+            else:
+                logger.info(f"{ticker}: BUY signal ignored (Downtrend: {current_price:.1f} < 60MA {ma60_val:.1f})")
             
-        # SELL Signal: K > 80 and K crosses below D
+        # SELL Signal: K > 80 and Dead Cross
         elif k_today > 80 and k_prev > d_prev and k_today < d_today:
-            signal = 'SELL'
+            if rsi_val > 70:
+                signal = 'HOLD' # Passivation - Hold
+                logger.info(f"{ticker}: SELL signal -> HOLD (RSI {rsi_val:.1f} > 70)")
+            else:
+                signal = 'SELL'
             
-        return signal, k_today, d_today, current_price
+        return signal, k_today, d_today, current_price, vol_ratio
 
     except Exception as e:
         logger.error(f"Error processing {ticker}: {e}")
-        return None, 0, 0, 0
+        return None, 0, 0, 0, 0.0
 
-def create_flex_message(ticker, signal, price, k, d, time_str):
+def create_flex_message(ticker, signal, price, k, d, time_str, fundamentals=None, vol_ratio=1.0):
     """
     Create a detailed Flex Message for the signal.
     """
-    # Color logic: Red for Buy (Taiwan stock up), Green for Sell (Taiwan stock down)
-    color = "#E03E3E" if signal == 'BUY' else "#2DB84D"
-    signal_text = "強勢買進 🚀" if signal == 'BUY' else "高檔賣出 📉"
+    # Color logic
+    # Color logic
+    if signal == 'BUY':
+        color = "#E03E3E"
+        signal_text = "強勢買進 🚀"
+    elif signal == 'HOLD':
+        color = "#FF9900"
+        signal_text = "高檔鈍化 (續抱) 💎"
+    else:
+        color = "#2DB84D"
+        signal_text = "高檔賣出 📉"
     
-    # ... (Bubble definition) ...
+    # Fundamentals formatting
+    fund_contents = []
+    if fundamentals:
+        pe = fundamentals.get('pe', 'N/A')
+        eps = fundamentals.get('eps', 'N/A')
+        dy = fundamentals.get('yield', 'N/A')
+        
+        pe_str = f"{pe:.1f}x" if isinstance(pe, (int, float)) else "-"
+        eps_str = f"{eps:.2f}" if isinstance(eps, (int, float)) else "-"
+        # Fix Yield: yfinance returns percentage (e.g. 1.2), not decimal
+        dy_str = f"{dy:.1f}%" if isinstance(dy, (int, float)) else "-"
+        
+        fund_contents = [
+             {
+                "type": "box",
+                "layout": "vertical",
+                "margin": "md",
+                "paddingAll": "12px",
+                "backgroundColor": "#f7f7f7",
+                "cornerRadius": "md",
+                "contents": [
+                     { "type": "text", "text": "基本面 (Fundamentals)", "size": "xxs", "color": "#aaaaaa", "weight": "bold", "margin": "none" },
+                     { "type": "separator", "margin": "sm" },
+                     {
+                        "type": "box",
+                        "layout": "horizontal",
+                        "margin": "md",
+                        "spacing": "xs",
+                        "contents": [
+                             # Stack 1: PE
+                             { "type": "text", "text": "PE", "size": "xxs", "color": "#888888", "flex": 1, "gravity": "bottom" },
+                             { "type": "text", "text": pe_str, "size": "xs", "color": "#333333", "flex": 2, "weight": "bold", "gravity": "bottom", "align": "end" },
+                             
+                             # Stack 2: EPS
+                             { "type": "text", "text": "EPS", "size": "xxs", "color": "#888888", "flex": 1, "margin": "md", "gravity": "bottom" },
+                             { "type": "text", "text": eps_str, "size": "xs", "color": "#333333", "flex": 2, "weight": "bold", "gravity": "bottom", "align": "end" }
+                        ]
+                     },
+                     {
+                        "type": "box",
+                        "layout": "horizontal",
+                        "margin": "sm",
+                        "spacing": "xs",
+                        "contents": [
+                             # Stack 3: Yield
+                             { "type": "text", "text": "Yield", "size": "xxs", "color": "#888888", "flex": 1, "gravity": "bottom" },
+                             { "type": "text", "text": dy_str, "size": "xs", "color": "#333333", "flex": 2, "weight": "bold", "gravity": "bottom", "align": "end" },
+                             
+                             # Filler (Empty box or filler)
+                             { "type": "filler", "flex": 3 } 
+                        ]
+                     }
+                ]
+             }
+        ]
+
+    # Volume Badge
+    vol_badge = []
+    if vol_ratio >= 2.0:
+        vol_badge = [{
+            "type": "text",
+            "text": f"🔥 爆量攻擊 ({vol_ratio:.1f}x)",
+            "weight": "bold",
+            "size": "sm",
+            "color": "#E03E3E", # Red
+            "margin": "md"
+        }]
+
     bubble = {
       "type": "bubble",
-      # ... (Header as before) ...
       "size": "mega",
       "header": {
         "type": "box",
@@ -148,10 +271,14 @@ def create_flex_message(ticker, signal, price, k, d, time_str):
             "weight": "bold",
             "color": color
           },
+          # Insert Volume Badge here
+          *vol_badge,
           {
             "type": "separator",
             "margin": "lg"
           },
+          # Insert Fundamentals here
+          *fund_contents,
           {
             "type": "box",
             "layout": "vertical",
@@ -181,7 +308,6 @@ def create_flex_message(ticker, signal, price, k, d, time_str):
                   }
                 ]
               },
-              # ... (D Value and Time) ...
               {
                 "type": "box",
                 "layout": "baseline",
@@ -347,23 +473,28 @@ def main():
         
         # 3. Check signals
         for ticker in tickers:
-            signal, k, d, price = check_kd_signal(ticker)
+            signal, k, d, price, vol_ratio = check_kd_signal(ticker) # Unpack vol_ratio
             if signal:
                 # MARKET FILTER LOGIC
                 if signal == 'BUY' and trend == 'DOWN':
                     logger.info(f"Signal detected for {ticker}: {signal}, but BLOCKED by Market Filter ({trend_msg})")
                     continue
 
+                # Fetch Fundamentals only for signals
+                fund_data = get_stock_fundamentals(ticker)
+
                 logger.info(f"Signal detected for {ticker}: {signal}")
                 ticker_signals[ticker] = {
                     'type': signal,
                     'k': k,
                     'd': d,
-                    'price': price
+                    'price': price,
+                    'vol_ratio': vol_ratio,
+                    'fundamentals': fund_data
                 }
             else:
-                pass # Silent logs for no signal to reduce noise
-        
+                pass 
+
         # 4. Notify subscribers
         if not ticker_signals:
             logger.info("No signals detected today.")
@@ -387,7 +518,9 @@ def main():
                     price=sig_data['price'],
                     k=sig_data['k'],
                     d=sig_data['d'],
-                    time_str=now_tw
+                    time_str=now_tw,
+                    fundamentals=sig_data['fundamentals'],
+                    vol_ratio=sig_data['vol_ratio']
                 )
                 
                 push_flex_notification(uid, msg)

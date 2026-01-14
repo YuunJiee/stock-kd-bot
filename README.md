@@ -1,24 +1,37 @@
-# Stock KD Signal Bot (台股 KD 訊號偵測機器人)
+# Stock KD Signal Bot (台股 KD 訊號偵測機器人) v2.0
 
 [![Stock KD Monitor](https://github.com/yuunjee/stock-kd-bot/actions/workflows/monitor.yml/badge.svg)](https://github.com/yuunjee/stock-kd-bot/actions/workflows/monitor.yml)
 
-這是一個基於 Python 的自動化機器人，用於監測台股的 KD 指標訊號，並透過 LINE Bot 發送買賣通知。設計用於部署在 GitHub Actions 上每日自動執行。
+這是一個基於 Python 的自動化機器人，用於監測台股的 KD 指標訊號，並透過 LINE Bot 發送專業的買賣通知。
 
-## 核心功能
+## 🌟 核心功能 (v2.0 升級版)
 
-*   **自動監測**：每日盤後自動抓取指定股票數據。
-*   **策略判斷**：使用 Stochastic Oscillator KD (14, 3) 指標。
-    *   🔴 **買入訊號**：$K < 20$ 且 $K$ 向上突破 $D$。
-    *   🟢 **賣出訊號**：$K > 80$ 且 $K$ 向下跌破 $D$。
-*   **LINE 通知**：偵測到訊號時，自動推播訊息給訂閱該股票的使用者。
-*   **雲端管理**：透過 Google Sheets 管理訂閱者名單 (`userId`, `ticker`)。
-*   **自動化部署**：整合 GitHub Actions，於每個交易日 (週一至週五) 台北時間 13:10 自動執行。
+### 1. 智慧策略監測 (Smart Strategy)
+本機器人不只是單純的 KD 交叉，更加入了 **趨勢濾網** 與 **鈍化處理**，大幅提高勝率。
+
+*   **📈 買進訊號 (Strong Buy)**
+    *   **條件 A**：$K < 20$ 且 $K$ 向上突破 $D$ (黃金交叉)。
+    *   **條件 B (趨勢保護)**：收盤價必須 **大於 60日均線 (季線)**，避開空頭接刀。
+*   **📉 賣出訊號 (Sell / Hold)**
+    *   **條件**：$K > 80$ 且 $K$ 向下跌破 $D$ (死亡交叉)。
+    *   **濾網 (高檔鈍化)**：若 **RSI > 70**，視為強勢鈍化，**不發送賣出訊號** (改為 **HOLD** 續抱通知)，吃到主升段。
+
+### 2. 進階基本面與籌碼資訊
+通知訊息卡片 (Flex Message) 包含：
+*   **基本面數據**：即時顯示本益比 (PE)、每股盈餘 (EPS)、殖利率 (Yield)。
+*   **爆量警示**：若當日成交量 > 5日均量的 2倍，顯示 `🔥 爆量攻擊` 標籤。
+
+### 3. 自動化與回測
+*   **backtest.py**：內建回測腳本，可驗證不同個股在過去一年的策略表現。
+*   **GitHub Actions**：每日 13:10 自動執行爬蟲與分析。
+
+---
 
 ## 技術棧
 
 *   **語言**：Python 3.12
 *   **數據來源**：`yfinance`
-*   **技術指標**：`pandas-ta`
+*   **技術指標**：`pandas-ta` (KD, RSI, MA, MACD)
 *   **資料庫**：Google Sheets (`gspread`)
 *   **通知**：LINE Messaging API (`line-bot-sdk`)
 
@@ -46,8 +59,19 @@ cp .env.example .env
 
 ### 3. 本地執行
 
+**執行主程式 (發送訊號)**：
 ```bash
 python main.py
+```
+
+**執行策略除錯 (測試版)**：
+```bash
+python debug_strategy.py
+```
+
+**執行歷史回測**：
+```bash
+python backtest.py
 ```
 
 ## GitHub Actions 部署
@@ -58,10 +82,6 @@ python main.py
 *   `LINE_CHANNEL_ACCESS_TOKEN`
 *   `LINE_CHANNEL_SECRET`
 *   `GOOGLE_SHEET_URL`
-
-## 詳細操作手冊
-
-更多關於環境建置 (WSL/Conda) 與 Git 操作的細節，請參閱 [MANUAL.md](./MANUAL.md)。
 
 ## License
 
